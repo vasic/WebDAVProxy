@@ -3,7 +3,6 @@
 var http = require('http');
 var querystring = require('querystring');
 var webdav_host='192.168.1.8';
-var webdav_path='/tunnel-web/secure/webdav/guest/document_library/folder1/safty_manual.pdf';
 var md5 = require('MD5');
 var origin = null;
 
@@ -69,13 +68,47 @@ UserInfo = function(userId, userName, sessionId, unameRealmPasswdDigest){
 }
 
 NeedAuthResponse = function(resRealm,resNonce){
-     this.realm = resRealm;
-     this.nonce = resNonce;
+    this.realm = resRealm;
+    this.nonce = resNonce;
 }
 
 
 var requestListener = function (request, response) {
+
+    console.log("received request "+ request.method + " : " + request.url);
+
+    if(request.url == '/crossdomain.xml'){
+        var crossdomainXml = "\<?xml version=\"1.0\"?>"+
+            "\<!DOCTYPE cross-domain-policy SYSTEM"+
+            "\"http://www.adobe.com/xml/dtds/cross-domain-policy.dtd\">"+
+            "\<cross-domain-policy\>"+
+            "\<site-control permitted-cross-domain-policies=\"all\"/>"+
+            "\<allow-access-from domain=\"*\" secure=\"false\"/>"+
+            "\<allow-http-request-headers-from domain=\"*\" headers=\"*\" secure=\"false\"/>"+
+            "\</cross-domain-policy>";
+
+        response.writeHead(
+            "200",
+            "OK",
+            {
+                "content-type": "application/xml",
+                "content-length": crossdomainXml.length
+            }
+        );
+        response.write(crossdomainXml);
+        response.end();
+        return;
+    }
+
+    var cookies = {};
+    request.headers.cookie && request.headers.cookie.split(';').forEach(function( cookie ) {
+        var parts = cookie.split('=');
+        cookies[ parts[ 0 ].trim() ] = ( parts[ 1 ] || '' ).trim();
+
+    });
+
     if(request.url == '/loginNotification'){
+        console.log("recived login notification");
         handleLoginNotification(request,response);
     }else if(cookies["httpAuthDigestInfo"]){
 
@@ -90,9 +123,21 @@ var requestListener = function (request, response) {
 
         if(request.method == 'GET'){
 
-            executeWebDAVCommand(mainResponse,'GET',request.url,userInfo);
+            executeWebDAVCommand(response,'GET',request.url,userInfo);
 
         }else if(request.method == 'POST'){
+
+            var reqData = '';
+            request.on('data', function (data) {
+                reqData += data;
+            });
+
+            request.on('end', function () {
+
+                //TODO find a method to tell the proxy what to do from URL
+                putResourceInWebdav(response,request.url,userInfo,reqData);
+            });
+
 
         }else{
             var proxyResponse = 'Currently only POST and GET methods are suported';
@@ -114,7 +159,91 @@ var requestListener = function (request, response) {
     }
 }
 
-var executeWebDAVCommand = function (mainResponse, methodName, webDAVpath, userInfo){
+/**
+ *
+ * @param mainResponse
+ * @param webDAVpath - is the url to the resource to be added. The url must end with the name of the new resource
+ *                     (e.g. : http://webdavhost/folder/newResource.pdf)
+ * @param userInfo
+ */
+var putResourceInWebdav= function(mainResponse,webDAVpath,userInfo,resource){
+
+    console.log("preparing put request for webdav");
+
+    var methodName='PUT';
+    var webdav_req_options = {
+        host: webdav_host,
+        path: webDAVpath,
+        method: methodName
+    };
+
+    var authResponse="";
+    var authValues=null;
+    var webdav_req = http.request(webdav_req_options, function(res) {
+        res.setEncoding('utf8');
+        res.on('end', function(){
+
+            console.log("received response for auth header from webdav : " + res.headers['www-authenticate']);
+            if(res.headers['www-authenticate']){
+                var serverAuthInfo = getRealmAndNonceFromResponse(res);
+                executeWebDAVPutCommand(mainResponse, serverAuthInfo, userInfo,methodName, webDAVpath,resource);
+            }
+        });
+        res.on('error', function(e) {
+            console.log('problem with response: ' + e.message);
+        });
+    });
+
+    webdav_req.on('error', function(e) {
+        console.log('problem with auth request: ' + e.message);
+    });
+    webdav_req.end();
+}
+
+var executeWebDAVPutCommand = function(mainResponse , serverAuthInfo, userInfo, methodName, webDAVpath,resource){
+
+    console.log('execute webdav put');
+    var digest = createAuthHeader(userInfo.unameRealmPasswdDigest,webDAVpath,methodName,serverAuthInfo.nonce,serverAuthInfo.realm,userInfo.userName);
+
+    var put_options = {
+        host: webdav_host,
+        path: webDAVpath,
+        method: methodName,
+        headers: {
+            'Authorization': digest
+        }
+    };
+
+    var put_req = http.request(put_options, function(res) {
+        res.setEncoding('utf8');
+        var data="";
+        res.on('data', function (chunk) {
+            data += chunk;
+        });
+
+        res.on('end', function(){
+            mainResponse.writeHead('200', {
+                'Content-Type' : 'text/plain;charset=utf-8',
+                'Content-Length' : data.length
+            });
+            mainResponse.write(data);
+            mainResponse.end();
+        });
+
+        res.on('error', function(e) {
+            console.log('problem with webdav response: ' + e.message);
+        });
+    });
+
+    put_req.on('error', function(e) {
+        console.log('problem with webdav PUT request: ' + e.message);
+    });
+
+    put_req.write(resource);
+    put_req.end();
+}
+
+var executeWebDAVCommand = function (mainResponse, methodName, webDAVpath, userInfo, file){
 
     var webdav_req_options = {
         host: webdav_host,
@@ -129,9 +258,10 @@ var executeWebDAVCommand = function (mainResponse, methodName, webDAVpath, userI
         res.on('end', function(){
 
             console.log("received response from webdav : " + res.headers['www-authenticate']);
-
-            var serverAuthInfo = getRealmAndNonceFromResponse(res);
-            executeCommand(mainResponse, serverAuthInfo, userInfo, webDAVpath);
+            if(res.headers['www-authenticate']){
+                var serverAuthInfo = getRealmAndNonceFromResponse(res);
+                executeCommand(mainResponse, serverAuthInfo, userInfo,methodName, webDAVpath);
+            }
         });
         res.on('error', function(e) {
             console.log('problem with response: ' + e.message);
@@ -179,7 +309,7 @@ var handleLoginNotification = function (request, response){
         }
 
         var proxyLoginResponse = '{ \"success\" : \"cookie was added\"}';
-        var requestData =querystring.parse(reqData,sep=', ',eq='=');
+        var requestData =querystring.parse(reqData);
         var userDigest = requestData.userDigest;
         var userName = requestData.userName;
 
@@ -223,15 +353,14 @@ var createAuthHeader = function(HA1, uri, methodName, nonce, realm, username){
 }
 
 
-var executeCommand = function( response , serverAuthInfo, userInfo, methodName){
-    var digest = createAuthHeader(userInfo.unameRealmPasswdDigest,webdav_path,methodName,serverAuthInfo.nonce,serverAuthInfo.realm,userInfo.userName);
+var executeCommand = function( response , serverAuthInfo, userInfo, methodName, webDAVpath){
+    var digest = createAuthHeader(userInfo.unameRealmPasswdDigest,webDAVpath,methodName,serverAuthInfo.nonce,serverAuthInfo.realm,userInfo.userName);
     getResourceFromWebDAV(digest,response,webDAVpath,methodName);
 
 }
 
 
 var getRealmAndNonceFromResponse = function(httpResonse){
-
     var authResponse = httpResonse.headers['www-authenticate'].replace(/\"/g, '');
     var authValues = querystring.parse(authResponse,sep=', ',eq='=');
     var needAuthResponse = new NeedAuthResponse();
@@ -285,4 +414,3 @@ var getResourceFromWebDAV = function (digest,response,webDAVpath,methodName){
 
 var server = http.createServer(requestListener);
 server.listen(8080);
-
